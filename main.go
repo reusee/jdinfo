@@ -45,8 +45,11 @@ var categories = []int{
 	11999, // 羊毛衫
 }
 
+var date = time.Now().Format("20060102")
+
 func main() {
-	maxPage := 250
+	db.MustExec(`DELETE FROM ranks WHERE date = ?`, date)
+	maxPage := 300
 	wg := new(sync.WaitGroup)
 	wg.Add(len(categories) * maxPage)
 	sem := make(chan bool, 8)
@@ -66,8 +69,6 @@ func main() {
 	}
 	wg.Wait()
 }
-
-var date = time.Now().Format("20060102")
 
 const itemsPerPage = 60
 
@@ -101,9 +102,9 @@ func collectCategoryPage(category int, page int) {
 				shopId,
 			)
 			ce(err, "insert shop")
-			_, err = tx.Exec(`INSERT INTO items (sku, category) VALUES (?, ?)
-				ON DUPLICATE KEY UPDATE sku=sku, category=?`,
-				sku, category, category,
+			_, err = tx.Exec(`INSERT INTO items (sku, category, shop_id) VALUES (?, ?, ?)
+				ON DUPLICATE KEY UPDATE sku=sku, category = ?, shop_id = ?`,
+				sku, category, shopId, category, shopId,
 			)
 			ce(err, "insert item")
 			_, err = tx.Exec(`INSERT INTO ranks (sku, date, rank) VALUES (?, ?, ?)

@@ -16,6 +16,7 @@ func initSchema() {
 	db.MustExec(`
 	CREATE TABLE IF NOT EXISTS items (
 		sku BIGINT PRIMARY KEY,
+		shop_id INT NOT NULL,
 		category INT NOT NULL
 	)
 	ROW_FORMAT=COMPRESSED
