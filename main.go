@@ -48,6 +48,11 @@ var categories = []int{
 var date = time.Now().Format("20060102")
 
 func main() {
+	collectCategoryPages()
+	collectShopLocations()
+}
+
+func collectCategoryPages() {
 	db.MustExec(`DELETE FROM ranks WHERE date = ?`, date)
 	maxPage := 300
 	wg := new(sync.WaitGroup)
@@ -116,4 +121,44 @@ func collectCategoryPage(category int, page int) {
 		})
 		return
 	}), "with tx")
+}
+
+func collectShopLocations() {
+	var ids []int
+	err := db.Select(&ids, `SELECT shop_id FROM shops
+		WHERE location IS NULL OR location = "" OR name IS NULL OR name = ""`)
+	ce(err, "select shop ids without location")
+	wg := new(sync.WaitGroup)
+	wg.Add(len(ids))
+	sem := make(chan bool, 4)
+	for _, id := range ids {
+		id := id
+		sem <- true
+		go func() {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			shopPageUrl := fmt.Sprintf("http://mall.jd.com/shopLevel-%d.html", id)
+			resp, err := http.Get(shopPageUrl)
+			ce(err, "get shop page")
+			doc, err := goquery.NewDocumentFromResponse(resp)
+			ce(err, "get doc")
+			var location, name string
+			doc.Find("span.label").Each(func(_ int, se *goquery.Selection) {
+				if se.Text() == "所在地：" {
+					se = se.SiblingsFiltered("span.value")
+					location = se.Text()
+				} else if se.Text() == "公司名称：" {
+					se = se.SiblingsFiltered("span.value")
+					name = se.Text()
+				}
+			})
+			db.MustExec(`UPDATE shops SET location = ?, name = ?
+					WHERE shop_id = ?`,
+				location, name, id)
+			pt("%15d %s %s\n", id, location, name)
+		}()
+	}
+	wg.Wait()
 }

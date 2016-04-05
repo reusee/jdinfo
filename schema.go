@@ -24,7 +24,10 @@ func initSchema() {
 
 	db.MustExec(`
 	CREATE TABLE IF NOT EXISTS shops (
-		shop_id INT PRIMARY KEY
+		shop_id INT PRIMARY KEY,
+		location CHAR(32),
+		name CHAR(128),
+		INDEX location (location)
 	)
 	ROW_FORMAT=COMPRESSED
 	`)
