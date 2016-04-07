@@ -67,7 +67,7 @@ func collectCategoryPages() {
 		}
 	}()
 
-	maxPage := 50
+	maxPage := 300
 	wg := new(sync.WaitGroup)
 	wg.Add(len(categories) * maxPage)
 	sem := make(chan bool, 8)
@@ -95,6 +95,7 @@ func collectCategoryPages() {
 		}
 	}
 	wg.Wait()
+	pt("all pages collected\n")
 	time.Sleep(time.Second)
 
 	// delete old rank data
@@ -116,6 +117,7 @@ func collectCategoryPages() {
 		}
 	}
 	ce(tx.Commit(), "commit")
+	pt("ranks updated\n")
 }
 
 const itemsPerPage = 60
@@ -175,7 +177,7 @@ func collectCategoryPage(category int, page int, ranksChan chan RankInfo) (err e
 func collectShopLocations() {
 	var ids []int
 	err := db.Select(&ids, `SELECT shop_id FROM shops
-		WHERE location IS NULL OR location = "" OR name IS NULL OR name = ""`)
+		WHERE location IS NULL OR location = '' OR name IS NULL OR name = ''`)
 	ce(err, "select shop ids without location")
 	wg := new(sync.WaitGroup)
 	wg.Add(len(ids))
