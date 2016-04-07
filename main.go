@@ -4,9 +4,10 @@ import "github.com/PuerkitoBio/goquery"
 import "fmt"
 import "net/http"
 import "time"
-import "github.com/jmoiron/sqlx"
 import "sync"
 import "sync/atomic"
+import "github.com/jmoiron/sqlx"
+import "strconv"
 
 var pt = fmt.Printf
 
@@ -52,9 +53,21 @@ func main() {
 	collectShopLocations()
 }
 
+type RankInfo struct {
+	Sku  int64
+	Rank int
+}
+
 func collectCategoryPages() {
-	db.MustExec(`DELETE FROM ranks WHERE date = ?`, date)
-	maxPage := 300
+	ranksChan := make(chan RankInfo)
+	ranksMap := make(map[int64]int)
+	go func() {
+		for info := range ranksChan {
+			ranksMap[info.Sku] = info.Rank
+		}
+	}()
+
+	maxPage := 50
 	wg := new(sync.WaitGroup)
 	wg.Add(len(categories) * maxPage)
 	sem := make(chan bool, 8)
@@ -68,18 +81,49 @@ func collectCategoryPages() {
 					<-sem
 					wg.Done()
 				}()
-				collectCategoryPage(category, page)
+				retry := 5
+			collect:
+				if err := collectCategoryPage(category, page, ranksChan); err != nil {
+					if retry > 0 {
+						retry--
+						time.Sleep(time.Second)
+						goto collect
+					}
+					ce(err, "collect %v %v", category, page)
+				}
 			}()
 		}
 	}
 	wg.Wait()
+	time.Sleep(time.Second)
+
+	// delete old rank data
+	db.MustExec(`DELETE FROM ranks WHERE date = $1`, date)
+	// update rank
+	c := 0
+	tx := db.MustBegin()
+	for sku, rank := range ranksMap {
+		_, err := tx.Exec(`INSERT INTO ranks (sku, date, rank) VALUES ($1, $2, $3)
+		ON CONFLICT (sku, date) DO UPDATE SET rank = $3`,
+			sku,
+			date,
+			rank)
+		ce(err, "insert rank")
+		c++
+		if c%2048 == 0 {
+			ce(tx.Commit(), "commit")
+			tx = db.MustBegin()
+		}
+	}
+	ce(tx.Commit(), "commit")
 }
 
 const itemsPerPage = 60
 
 var pageCount int64
 
-func collectCategoryPage(category int, page int) {
+func collectCategoryPage(category int, page int, ranksChan chan RankInfo) (err error) {
+	defer ct(&err)
 	pt("%-10d %-10d %-10d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
 		category, page)
@@ -91,10 +135,12 @@ func collectCategoryPage(category int, page int) {
 	ce(withTx(db, func(tx *sqlx.Tx) (err error) {
 		defer ct(&err)
 		itemSes.Each(func(i int, se *goquery.Selection) {
-			sku, ok := se.Attr("data-sku")
+			skuStr, ok := se.Attr("data-sku")
 			if !ok {
 				panic(me(nil, "no sku %s", pageUrl))
 			}
+			sku, err := strconv.ParseInt(skuStr, 10, 64)
+			ce(err, "parse sku")
 			shopId, ok := se.Attr("jdzy_shop_id")
 			if !ok {
 				panic(me(nil, "no shop id %s", pageUrl))
@@ -102,25 +148,28 @@ func collectCategoryPage(category int, page int) {
 			if shopId == "0" { // 自营的
 				return
 			}
-			_, err := tx.Exec(`INSERT INTO shops (shop_id) VALUES (?)
-				ON DUPLICATE KEY UPDATE shop_id=shop_id`,
+			title := se.Find("div.p-name em").Text()
+			if len(title) == 0 {
+				panic(me(nil, "no title %s", pageUrl))
+			}
+			_, err = tx.Exec(`INSERT INTO shops (shop_id) VALUES ($1)
+				ON CONFLICT (shop_id) DO NOTHING`,
 				shopId,
 			)
 			ce(err, "insert shop")
-			_, err = tx.Exec(`INSERT INTO items (sku, category, shop_id) VALUES (?, ?, ?)
-				ON DUPLICATE KEY UPDATE sku=sku, category = ?, shop_id = ?`,
-				sku, category, shopId, category, shopId,
+			_, err = tx.Exec(`INSERT INTO items (sku, category, shop_id, title) VALUES ($1, $2, $3, $4)
+				ON CONFLICT (sku) DO UPDATE SET category = $2, shop_id = $3`,
+				sku, category, shopId, title,
 			)
 			ce(err, "insert item")
-			_, err = tx.Exec(`INSERT INTO ranks (sku, date, rank) VALUES (?, ?, ?)
-				ON DUPLICATE KEY UPDATE rank=rank`,
-				sku,
-				date,
-				itemsPerPage*(page-1)+i)
-			ce(err, "insert rank")
+			ranksChan <- RankInfo{
+				Sku:  sku,
+				Rank: itemsPerPage*(page-1) + i,
+			}
 		})
 		return
 	}), "with tx")
+	return
 }
 
 func collectShopLocations() {
@@ -154,9 +203,10 @@ func collectShopLocations() {
 					name = se.Text()
 				}
 			})
-			db.MustExec(`UPDATE shops SET location = ?, name = ?
-					WHERE shop_id = ?`,
+			_, err = db.Exec(`UPDATE shops SET location = $1, name = $2
+					WHERE shop_id = $3`,
 				location, name, id)
+			ce(err, "update shops")
 			pt("%15d %s %s\n", id, location, name)
 		}()
 	}

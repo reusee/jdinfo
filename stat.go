@@ -9,7 +9,7 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-import _ "github.com/go-sql-driver/mysql"
+import _ "github.com/lib/pq"
 
 import "fmt"
 
@@ -19,7 +19,7 @@ var db *sqlx.DB
 
 func init() {
 	var err error
-	db, err = sqlx.Connect("mysql", "root:ffffff@tcp(127.0.0.1:3306)/jd?parseTime=true&autocommit=true")
+	db, err = sqlx.Connect("postgres", "user=reus dbname=jd sslmode=disable")
 	ce(err, "connect to db")
 }
 
@@ -41,9 +41,9 @@ func main() {
 		ON a.sku = b.sku
 		LEFT JOIN shops c
 		ON b.shop_id = c.shop_id
-		WHERE category = ?
-		AND date = ?
-		AND location = "广东  广州市"
+		WHERE category = $1
+		AND date = $2
+		AND location = '广东  广州市'
 		`, category, date)
 		ce(err, "query")
 		ranks := make(map[int64]*Entry)
@@ -74,19 +74,28 @@ func main() {
 		}
 	}
 	pairs.Sort(func(a, b [2]*Entry) bool {
-		return (a[0].Rank - a[1].Rank) < (b[0].Rank - b[1].Rank)
+		return (a[0].Rank - a[1].Rank) > (b[0].Rank - b[1].Rank)
 	})
 
 	fmt.Printf("%d entries\n", len(pairs))
 	for i, pair := range pairs {
 		prevEntry, curEntry := pair[0], pair[1]
 		delta := prevEntry.Rank - curEntry.Rank
-		fmt.Printf("%-4d: cur %3d页%2d位 prev %3d页%2d位 delta %3d页%2d位 shop %-6d %s\n", i,
+		fmt.Printf("%-4d: %-37s %3d页%2d位 <- %3d页%2d位 升 %3d页%2d位 %s\n",
+			i+1,
+			fmt.Sprintf("http://item.jd.com/%d.html", curEntry.Sku),
 			curEntry.Rank/60+1, curEntry.Rank%60+1,
 			prevEntry.Rank/60+1, prevEntry.Rank%60+1,
 			delta/60+1, delta%60+1,
-			curEntry.ShopId, curEntry.ShopName)
-		fmt.Printf("http://item.jd.com/%d.html\n", curEntry.Sku)
+			curEntry.ShopName)
+
+		var c int
+		err := db.Get(&c, `SELECT COUNT(*) FROM images
+			WHERE sku = $1`, curEntry.Sku)
+		ce(err, "get image count")
+		if c == 0 { // download images
+			//TODO
+		}
 	}
 
 }

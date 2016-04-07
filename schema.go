@@ -1,13 +1,13 @@
 package main
 
 import "github.com/jmoiron/sqlx"
-import _ "github.com/go-sql-driver/mysql"
+import _ "github.com/lib/pq"
 
 var db *sqlx.DB
 
 func init() {
 	var err error
-	db, err = sqlx.Connect("mysql", "root:ffffff@tcp(127.0.0.1:3306)/jd?parseTime=true&autocommit=true")
+	db, err = sqlx.Connect("postgres", "user=reus dbname=jd sslmode=disable")
 	ce(err, "connect to db")
 	initSchema()
 }
@@ -17,30 +17,51 @@ func initSchema() {
 	CREATE TABLE IF NOT EXISTS items (
 		sku BIGINT PRIMARY KEY,
 		shop_id INT NOT NULL,
-		category INT NOT NULL
+		category INT NOT NULL,
+		title TEXT
 	)
-	ROW_FORMAT=COMPRESSED
 	`)
 
 	db.MustExec(`
 	CREATE TABLE IF NOT EXISTS shops (
 		shop_id INT PRIMARY KEY,
-		location CHAR(32),
-		name CHAR(128),
-		INDEX location (location)
+		location TEXT,
+		name TEXT
 	)
-	ROW_FORMAT=COMPRESSED
+	`)
+	db.MustExec(`
+	CREATE INDEX IF NOT EXISTS location ON shops (location)
 	`)
 
 	db.MustExec(`
 	CREATE TABLE IF NOT EXISTS ranks (
 		sku BIGINT NOT NULL,
-		date CHAR(8) NOT NULL,
-		rank INT NOT NULL,
-		UNIQUE INDEX sku_date (sku, date),
-		INDEX date (date)
+		date TEXT NOT NULL,
+		rank INT NOT NULL
 	)
-	ROW_FORMAT=COMPRESSED
 	`)
+	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS sku_date ON ranks
+		(sku, date)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS date ON ranks (date)`)
+
+	db.MustExec(`
+	CREATE TABLE IF NOT EXISTS images (
+		sku BIGINT,
+		url_id INT
+	)
+	`)
+	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS sku_image ON images
+		(sku, url_id)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS url_id ON images (url_id)`)
+
+	db.MustExec(`
+	CREATE TABLE IF NOT EXISTS urls (
+		url_id SERIAL PRIMARY KEY,
+		url TEXT NOT NULL,
+		sha512 BYTEA
+	)
+	`)
+	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS url ON urls (url)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS sha512 ON urls (sha512)`)
 
 }

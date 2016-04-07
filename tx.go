@@ -1,11 +1,40 @@
 package main
 
 import (
-	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 func withTx(db *sqlx.DB, fn func(tx *sqlx.Tx) error) error {
+begin:
+	tx := db.MustBegin()
+	err := fn(tx)
+	if err != nil {
+		tx.Rollback()
+		if e, ok := err.(*Err); ok {
+			err = e.Origin()
+		}
+		if err, ok := err.(*pq.Error); ok && err.Code.Name() == "deadlock_detected" {
+			goto begin
+		}
+		return err
+	}
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		if e, ok := err.(*Err); ok {
+			err = e.Origin()
+		}
+		if err, ok := err.(*pq.Error); ok && err.Code.Name() == "deadlock_detected" {
+			goto begin
+		}
+		return err
+	}
+	return nil
+}
+
+/*
+func withMysqlTx(db *sqlx.DB, fn func(tx *sqlx.Tx) error) error {
 begin:
 	tx := db.MustBegin()
 	err := fn(tx)
@@ -32,3 +61,4 @@ begin:
 	}
 	return nil
 }
+*/
