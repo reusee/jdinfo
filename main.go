@@ -1,4 +1,3 @@
-//TODO 记录评论数，避免太过劣势的单品
 package main
 
 import "github.com/PuerkitoBio/goquery"
@@ -9,6 +8,8 @@ import "sync"
 import "sync/atomic"
 import "github.com/jmoiron/sqlx"
 import "strconv"
+import "strings"
+import "encoding/json"
 
 var pt = fmt.Printf
 
@@ -52,6 +53,7 @@ var date = time.Now().Format("20060102")
 func main() {
 	collectCategoryPages()
 	collectShopLocations()
+	collectPrices()
 }
 
 type Info struct {
@@ -228,4 +230,54 @@ func collectShopLocations() {
 		}()
 	}
 	wg.Wait()
+}
+
+func collectPrices() {
+	n := 0
+	for {
+		var skus []int64
+		err := db.Select(&skus, `SELECT sku FROM infos
+		WHERE
+		date = $1
+		AND price = 0
+		LIMIT 60`,
+			date)
+		ce(err, "select skus")
+		if len(skus) == 0 {
+			break
+		}
+		var skuIds []string
+		for _, sku := range skus {
+			skuIds = append(skuIds, "J_"+strconv.FormatInt(sku, 10))
+		}
+		reqUrl := "http://p.3.cn/prices/mgets?type=1&skuIds=" +
+			strings.Join(skuIds, ",")
+		resp, err := http.Get(reqUrl)
+		ce(err, "get %s", reqUrl)
+		defer resp.Body.Close()
+		var data []struct {
+			Id string
+			P  string
+		}
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		ce(err, "decode")
+		if len(data) != len(skus) {
+			panic(me(nil, "invalid json %s", reqUrl))
+		}
+		tx := db.MustBegin()
+		for _, row := range data {
+			_, err := tx.Exec(`UPDATE infos SET
+			price = $1
+			WHERE
+			date = $2
+			AND sku = $3`,
+				row.P,
+				date,
+				row.Id[2:])
+			ce(err, "update price")
+		}
+		ce(tx.Commit(), "commit")
+		n++
+		pt("%d\n", n)
+	}
 }

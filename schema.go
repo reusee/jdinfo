@@ -39,7 +39,8 @@ func initSchema() {
 		date TEXT NOT NULL,
 		category INT NOT NULL,
 		rank INT NOT NULL,
-		sales INT NOT NULL
+		sales INT NOT NULL,
+		price DECIMAL(10, 2) NOT NULL
 	)
 	`)
 	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS sku_date_cat 
