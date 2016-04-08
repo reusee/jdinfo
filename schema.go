@@ -34,15 +34,20 @@ func initSchema() {
 	`)
 
 	db.MustExec(`
-	CREATE TABLE IF NOT EXISTS ranks (
+	CREATE TABLE IF NOT EXISTS infos (
 		sku BIGINT NOT NULL,
 		date TEXT NOT NULL,
-		rank INT NOT NULL
+		category INT NOT NULL,
+		rank INT NOT NULL,
+		sales INT NOT NULL
 	)
 	`)
-	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS sku_date ON ranks
-		(sku, date)`)
-	db.MustExec(`CREATE INDEX IF NOT EXISTS date ON ranks (date)`)
+	db.MustExec(`CREATE UNIQUE INDEX IF NOT EXISTS sku_date_cat 
+		ON infos
+		(sku, date, category)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS date ON infos (date)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS sales ON infos (sales)`)
+	db.MustExec(`CREATE INDEX IF NOT EXISTS category ON infos (category)`)
 
 	db.MustExec(`
 	CREATE TABLE IF NOT EXISTS images (

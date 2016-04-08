@@ -1,3 +1,4 @@
+//TODO 记录评论数，避免太过劣势的单品
 package main
 
 import "github.com/PuerkitoBio/goquery"
@@ -53,17 +54,19 @@ func main() {
 	collectShopLocations()
 }
 
-type RankInfo struct {
-	Sku  int64
-	Rank int
+type Info struct {
+	Sku      int64
+	Category int
+	Rank     int
+	Sales    int
 }
 
 func collectCategoryPages() {
-	ranksChan := make(chan RankInfo)
-	ranksMap := make(map[int64]int)
+	infosChan := make(chan Info)
+	infosMap := make(map[int64]Info)
 	go func() {
-		for info := range ranksChan {
-			ranksMap[info.Sku] = info.Rank
+		for info := range infosChan {
+			infosMap[info.Sku] = info
 		}
 	}()
 
@@ -83,7 +86,7 @@ func collectCategoryPages() {
 				}()
 				retry := 5
 			collect:
-				if err := collectCategoryPage(category, page, ranksChan); err != nil {
+				if err := collectCategoryPage(category, page, infosChan); err != nil {
 					if retry > 0 {
 						retry--
 						time.Sleep(time.Second)
@@ -98,17 +101,21 @@ func collectCategoryPages() {
 	pt("all pages collected\n")
 	time.Sleep(time.Second)
 
-	// delete old rank data
-	db.MustExec(`DELETE FROM ranks WHERE date = $1`, date)
-	// update rank
+	// delete old data
+	db.MustExec(`DELETE FROM infos WHERE date = $1`, date)
+	// update infos
 	c := 0
 	tx := db.MustBegin()
-	for sku, rank := range ranksMap {
-		_, err := tx.Exec(`INSERT INTO ranks (sku, date, rank) VALUES ($1, $2, $3)
-		ON CONFLICT (sku, date) DO UPDATE SET rank = $3`,
+	for sku, info := range infosMap {
+		_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category) 
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (sku, date, category) DO UPDATE SET 
+			rank = $3, sales = $4`,
 			sku,
 			date,
-			rank)
+			info.Rank,
+			info.Sales,
+			info.Category)
 		ce(err, "insert rank")
 		c++
 		if c%2048 == 0 {
@@ -117,14 +124,14 @@ func collectCategoryPages() {
 		}
 	}
 	ce(tx.Commit(), "commit")
-	pt("ranks updated\n")
+	pt("infos updated\n")
 }
 
 const itemsPerPage = 60
 
 var pageCount int64
 
-func collectCategoryPage(category int, page int, ranksChan chan RankInfo) (err error) {
+func collectCategoryPage(category int, page int, infosChan chan Info) (err error) {
 	defer ct(&err)
 	pt("%-10d %-10d %-10d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
@@ -154,6 +161,12 @@ func collectCategoryPage(category int, page int, ranksChan chan RankInfo) (err e
 			if len(title) == 0 {
 				panic(me(nil, "no title %s", pageUrl))
 			}
+			salesStr := se.Find("div.p-commit a").Text()
+			if len(salesStr) == 0 {
+				panic(me(nil, "no sales %s", pageUrl))
+			}
+			sales, err := strconv.Atoi(salesStr)
+			ce(err, "parse sales %s", salesStr)
 			_, err = tx.Exec(`INSERT INTO shops (shop_id) VALUES ($1)
 				ON CONFLICT (shop_id) DO NOTHING`,
 				shopId,
@@ -164,9 +177,11 @@ func collectCategoryPage(category int, page int, ranksChan chan RankInfo) (err e
 				sku, category, shopId, title,
 			)
 			ce(err, "insert item")
-			ranksChan <- RankInfo{
-				Sku:  sku,
-				Rank: itemsPerPage*(page-1) + i,
+			infosChan <- Info{
+				Sku:      sku,
+				Rank:     itemsPerPage*(page-1) + i,
+				Sales:    sales,
+				Category: category,
 			}
 		})
 		return

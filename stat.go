@@ -1,4 +1,4 @@
-//+build no
+//+build ignore
 
 package main
 
@@ -23,7 +23,7 @@ func init() {
 	ce(err, "connect to db")
 }
 
-type Entry struct {
+type Info struct {
 	Sku      int64
 	Rank     int
 	ShopId   int    `db:"shop_id"`
@@ -35,63 +35,64 @@ func main() {
 	curDate := os.Args[2]
 	category := os.Args[3]
 
-	getRanks := func(date string, category string) map[int64]*Entry {
-		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM ranks a
+	getInfos := func(date string, category string) map[int64]*Info {
+		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
 		LEFT JOIN items b
 		ON a.sku = b.sku
 		LEFT JOIN shops c
 		ON b.shop_id = c.shop_id
-		WHERE category = $1
+		WHERE a.category = $1
 		AND date = $2
+		AND sales < 10
 		AND location = '广东  广州市'
 		`, category, date)
 		ce(err, "query")
-		ranks := make(map[int64]*Entry)
+		infos := make(map[int64]*Info)
 		for rows.Next() {
-			entry := new(Entry)
-			ce(rows.StructScan(entry), "scan")
-			ranks[entry.Sku] = entry
+			info := new(Info)
+			ce(rows.StructScan(info), "scan")
+			infos[info.Sku] = info
 		}
 		ce(rows.Err(), "rows err")
-		return ranks
+		return infos
 	}
-	prevRanks := getRanks(prevDate, category)
-	if len(prevRanks) == 0 {
+	prevInfos := getInfos(prevDate, category)
+	if len(prevInfos) == 0 {
 		panic(me(nil, "invalid prev date %s", prevDate))
 	}
-	curRanks := getRanks(curDate, category)
-	if len(curRanks) == 0 {
+	curInfos := getInfos(curDate, category)
+	if len(curInfos) == 0 {
 		panic(me(nil, "invalid cur date %s", curDate))
 	}
 
-	pairs := EntryPair(make([][2]*Entry, 0))
-	for sku, curEntry := range curRanks {
-		prevEntry, ok := prevRanks[sku]
-		if ok && curEntry.Rank < prevEntry.Rank && curEntry.Rank <= 1800 && prevEntry.Rank-curEntry.Rank > 300 {
-			pairs = append(pairs, [2]*Entry{
-				prevEntry, curEntry,
+	pairs := InfoPair(make([][2]*Info, 0))
+	for sku, curInfo := range curInfos {
+		prevInfo, ok := prevInfos[sku]
+		if ok && curInfo.Rank < prevInfo.Rank && curInfo.Rank <= 3000 && prevInfo.Rank-curInfo.Rank > 60 {
+			pairs = append(pairs, [2]*Info{
+				prevInfo, curInfo,
 			})
 		}
 	}
-	pairs.Sort(func(a, b [2]*Entry) bool {
+	pairs.Sort(func(a, b [2]*Info) bool {
 		return (a[0].Rank - a[1].Rank) > (b[0].Rank - b[1].Rank)
 	})
 
 	fmt.Printf("%d entries\n", len(pairs))
 	for i, pair := range pairs {
-		prevEntry, curEntry := pair[0], pair[1]
-		delta := prevEntry.Rank - curEntry.Rank
+		prevInfo, curInfo := pair[0], pair[1]
+		delta := prevInfo.Rank - curInfo.Rank
 		fmt.Printf("%-4d: %-37s %3d页%2d位 <- %3d页%2d位 升 %3d页%2d位 %s\n",
 			i+1,
-			fmt.Sprintf("http://item.jd.com/%d.html", curEntry.Sku),
-			curEntry.Rank/60+1, curEntry.Rank%60+1,
-			prevEntry.Rank/60+1, prevEntry.Rank%60+1,
+			fmt.Sprintf("http://item.jd.com/%d.html", curInfo.Sku),
+			curInfo.Rank/60+1, curInfo.Rank%60+1,
+			prevInfo.Rank/60+1, prevInfo.Rank%60+1,
 			delta/60+1, delta%60+1,
-			curEntry.ShopName)
+			curInfo.ShopName)
 
 		var c int
 		err := db.Get(&c, `SELECT COUNT(*) FROM images
-			WHERE sku = $1`, curEntry.Sku)
+			WHERE sku = $1`, curInfo.Sku)
 		ce(err, "get image count")
 		if c == 0 { // download images
 			//TODO
@@ -152,9 +153,9 @@ func ct(err *error) {
 	}
 }
 
-type EntryPair [][2]*Entry
+type InfoPair [][2]*Info
 
-func (s EntryPair) Reduce(initial interface{}, fn func(value interface{}, elem [2]*Entry) interface{}) (ret interface{}) {
+func (s InfoPair) Reduce(initial interface{}, fn func(value interface{}, elem [2]*Info) interface{}) (ret interface{}) {
 	ret = initial
 	for _, elem := range s {
 		ret = fn(ret, elem)
@@ -162,14 +163,14 @@ func (s EntryPair) Reduce(initial interface{}, fn func(value interface{}, elem [
 	return
 }
 
-func (s EntryPair) Map(fn func([2]*Entry) [2]*Entry) (ret EntryPair) {
+func (s InfoPair) Map(fn func([2]*Info) [2]*Info) (ret InfoPair) {
 	for _, elem := range s {
 		ret = append(ret, fn(elem))
 	}
 	return
 }
 
-func (s EntryPair) Filter(filter func([2]*Entry) bool) (ret EntryPair) {
+func (s InfoPair) Filter(filter func([2]*Info) bool) (ret InfoPair) {
 	for _, elem := range s {
 		if filter(elem) {
 			ret = append(ret, elem)
@@ -178,7 +179,7 @@ func (s EntryPair) Filter(filter func([2]*Entry) bool) (ret EntryPair) {
 	return
 }
 
-func (s EntryPair) All(predict func([2]*Entry) bool) (ret bool) {
+func (s InfoPair) All(predict func([2]*Info) bool) (ret bool) {
 	ret = true
 	for _, elem := range s {
 		ret = predict(elem) && ret
@@ -186,27 +187,27 @@ func (s EntryPair) All(predict func([2]*Entry) bool) (ret bool) {
 	return
 }
 
-func (s EntryPair) Any(predict func([2]*Entry) bool) (ret bool) {
+func (s InfoPair) Any(predict func([2]*Info) bool) (ret bool) {
 	for _, elem := range s {
 		ret = predict(elem) || ret
 	}
 	return
 }
 
-func (s EntryPair) Each(fn func(e [2]*Entry)) {
+func (s InfoPair) Each(fn func(e [2]*Info)) {
 	for _, elem := range s {
 		fn(elem)
 	}
 }
 
-func (s EntryPair) Shuffle() {
+func (s InfoPair) Shuffle() {
 	for i := len(s) - 1; i >= 1; i-- {
 		j := rand.Intn(i + 1)
 		s[i], s[j] = s[j], s[i]
 	}
 }
 
-func (s EntryPair) Sort(cmp func(a, b [2]*Entry) bool) {
+func (s InfoPair) Sort(cmp func(a, b [2]*Info) bool) {
 	sorter := sliceSorter{
 		l: len(s),
 		less: func(i, j int) bool {
@@ -240,8 +241,8 @@ func (t sliceSorter) Swap(i, j int) {
 	t.swap(i, j)
 }
 
-func (s EntryPair) Clone() (ret EntryPair) {
-	ret = make([][2]*Entry, len(s))
+func (s InfoPair) Clone() (ret InfoPair) {
+	ret = make([][2]*Info, len(s))
 	copy(ret, s)
 	return
 }
