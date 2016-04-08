@@ -1,5 +1,7 @@
 package main
 
+import "bytes"
+import "io/ioutil"
 import "github.com/PuerkitoBio/goquery"
 import "fmt"
 import "net/http"
@@ -53,7 +55,6 @@ var date = time.Now().Format("20060102")
 func main() {
 	collectCategoryPages()
 	collectShopLocations()
-	collectPrices()
 }
 
 type Info struct {
@@ -61,18 +62,25 @@ type Info struct {
 	Category int
 	Rank     int
 	Sales    int
+	Price    string
 }
 
+const maxPage = 300
+
 func collectCategoryPages() {
-	infosChan := make(chan Info)
-	infosMap := make(map[int64]Info)
+
+	infosChan := make(chan map[int64]*Info)
+	infosMap := make(map[int64]*Info)
+	infosMapReady := make(chan struct{})
 	go func() {
-		for info := range infosChan {
-			infosMap[info.Sku] = info
+		for infos := range infosChan {
+			for _, info := range infos {
+				infosMap[info.Sku] = info
+			}
 		}
+		close(infosMapReady)
 	}()
 
-	maxPage := 300
 	wg := new(sync.WaitGroup)
 	wg.Add(len(categories) * maxPage)
 	sem := make(chan bool, 8)
@@ -101,7 +109,8 @@ func collectCategoryPages() {
 	}
 	wg.Wait()
 	pt("all pages collected\n")
-	time.Sleep(time.Second)
+	close(infosChan)
+	<-infosMapReady
 
 	// delete old data
 	db.MustExec(`DELETE FROM infos WHERE date = $1`, date)
@@ -109,15 +118,16 @@ func collectCategoryPages() {
 	c := 0
 	tx := db.MustBegin()
 	for sku, info := range infosMap {
-		_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category) 
-			VALUES ($1, $2, $3, $4, $5)
+		_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category, price) 
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (sku, date, category) DO UPDATE SET 
-			rank = $3, sales = $4`,
+			rank = $3, sales = $4, price = $6`,
 			sku,
 			date,
 			info.Rank,
 			info.Sales,
-			info.Category)
+			info.Category,
+			info.Price)
 		ce(err, "insert rank")
 		c++
 		if c%2048 == 0 {
@@ -127,22 +137,63 @@ func collectCategoryPages() {
 	}
 	ce(tx.Commit(), "commit")
 	pt("infos updated\n")
+
+	// re-collect invalid prices
+	var skus []int64
+	err := db.Select(&skus, `SELECT sku FROM infos
+			WHERE 
+			date = $1
+			AND price <= 0`,
+		date)
+	ce(err, "select skus")
+	for i := 0; i < len(skus)/60+1; i++ {
+		start := i * 60
+		end := start + 60
+		if end > len(skus) {
+			end = len(skus)
+		}
+		var skuIds []string
+		for _, sku := range skus[start:end] {
+			skuIds = append(skuIds, "J_"+strconv.FormatInt(sku, 10))
+		}
+		data, err := getPrices(skuIds)
+		ce(err, "get prices")
+		tx := db.MustBegin()
+		for _, row := range data {
+			_, err = tx.Exec(`UPDATE infos SET
+				price = $1
+				WHERE
+				sku = $2
+				AND date = $3`,
+				row.P,
+				row.Id[2:],
+				date)
+			ce(err, "update price")
+		}
+		ce(tx.Commit(), "commit")
+		pt("%v\n", skuIds)
+	}
+
 }
 
 const itemsPerPage = 60
 
 var pageCount int64
 
-func collectCategoryPage(category int, page int, infosChan chan Info) (err error) {
+func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info) (err error) {
 	defer ct(&err)
 	pt("%-10d %-10d %-10d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
 		category, page)
 	resp, err := http.Get(pageUrl)
 	ce(err, "get page %s", pageUrl)
-	doc, err := goquery.NewDocumentFromResponse(resp)
-	ce(err, "doc from resp %s", pageUrl)
+	defer resp.Body.Close()
+	content, err := ioutil.ReadAll(resp.Body)
+	ce(err, "read body")
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(content))
+	ce(err, "doc from reader %s", pageUrl)
 	itemSes := doc.Find("div#plist div.j-sku-item")
+	infos := make(map[int64]*Info)
 	ce(withTx(db, func(tx *sqlx.Tx) (err error) {
 		defer ct(&err)
 		itemSes.Each(func(i int, se *goquery.Selection) {
@@ -156,9 +207,9 @@ func collectCategoryPage(category int, page int, infosChan chan Info) (err error
 			if !ok {
 				panic(me(nil, "no shop id %s", pageUrl))
 			}
-			if shopId == "0" { // 自营的
-				return
-			}
+			//if shopId == "0" { // 自营的
+			//	return
+			//}
 			title := se.Find("div.p-name em").Text()
 			if len(title) == 0 {
 				panic(me(nil, "no title %s", pageUrl))
@@ -179,7 +230,7 @@ func collectCategoryPage(category int, page int, infosChan chan Info) (err error
 				sku, category, shopId, title,
 			)
 			ce(err, "insert item")
-			infosChan <- Info{
+			infos[sku] = &Info{
 				Sku:      sku,
 				Rank:     itemsPerPage*(page-1) + i,
 				Sales:    sales,
@@ -188,6 +239,50 @@ func collectCategoryPage(category int, page int, infosChan chan Info) (err error
 		})
 		return
 	}), "with tx")
+
+	// collect prices
+	var skuIds []string
+	for _, info := range infos {
+		skuIds = append(skuIds, "J_"+strconv.FormatInt(info.Sku, 10))
+	}
+	data, err := getPrices(skuIds)
+	ce(err, "get prices")
+	if len(data) != len(infos) {
+		panic(me(nil, "invalid json"))
+	}
+	for _, priceInfo := range data {
+		sku, err := strconv.ParseInt(priceInfo.Id[2:], 10, 64)
+		ce(err, "parse sku %s", priceInfo.Id)
+		infos[sku].Price = priceInfo.P
+	}
+
+	infosChan <- infos
+
+	return
+}
+
+func getPrices(skuIds []string) (data []struct {
+	Id string
+	P  string
+}, err error) {
+	defer ct(&err)
+	retry := 10
+collectPrices:
+	reqUrl := "http://p.3.cn/prices/mgets?type=1&skuIds=" +
+		strings.Join(skuIds, ",")
+	resp, err := http.Get(reqUrl)
+	ce(err, "get %s", reqUrl)
+	defer resp.Body.Close()
+	content, err := ioutil.ReadAll(resp.Body)
+	ce(err, "read body")
+	err = json.Unmarshal(content, &data)
+	if err != nil {
+		if retry > 0 {
+			retry--
+			goto collectPrices
+		}
+		ce(err, "decode %s, %s", reqUrl, content)
+	}
 	return
 }
 
@@ -230,54 +325,4 @@ func collectShopLocations() {
 		}()
 	}
 	wg.Wait()
-}
-
-func collectPrices() {
-	n := 0
-	for {
-		var skus []int64
-		err := db.Select(&skus, `SELECT sku FROM infos
-		WHERE
-		date = $1
-		AND price = 0
-		LIMIT 60`,
-			date)
-		ce(err, "select skus")
-		if len(skus) == 0 {
-			break
-		}
-		var skuIds []string
-		for _, sku := range skus {
-			skuIds = append(skuIds, "J_"+strconv.FormatInt(sku, 10))
-		}
-		reqUrl := "http://p.3.cn/prices/mgets?type=1&skuIds=" +
-			strings.Join(skuIds, ",")
-		resp, err := http.Get(reqUrl)
-		ce(err, "get %s", reqUrl)
-		defer resp.Body.Close()
-		var data []struct {
-			Id string
-			P  string
-		}
-		err = json.NewDecoder(resp.Body).Decode(&data)
-		ce(err, "decode")
-		if len(data) != len(skus) {
-			panic(me(nil, "invalid json %s", reqUrl))
-		}
-		tx := db.MustBegin()
-		for _, row := range data {
-			_, err := tx.Exec(`UPDATE infos SET
-			price = $1
-			WHERE
-			date = $2
-			AND sku = $3`,
-				row.P,
-				date,
-				row.Id[2:])
-			ce(err, "update price")
-		}
-		ce(tx.Commit(), "commit")
-		n++
-		pt("%d\n", n)
-	}
 }
