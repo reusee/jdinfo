@@ -30,12 +30,32 @@ type Info struct {
 	ShopName string `db:"shop_name"`
 }
 
+var categories = map[string]int{
+	"衬衫":    1354,
+	"T恤":    1355,
+	"针织衫":   1356,
+	"雪纺衫":   9713,
+	"牛仔裤":   9715,
+	"休闲裤":   9717,
+	"连衣裙":   9719,
+	"半身裙":   9720,
+	"短裤":    11991,
+	"吊带，背心": 11988,
+}
+
 func main() {
+	for name, category := range categories {
+		fmt.Printf("=== %s ===\n", name)
+		statCategory(category)
+		fmt.Printf("\n")
+	}
+}
+
+func statCategory(category int) {
 	prevDate := os.Args[1]
 	curDate := os.Args[2]
-	category := os.Args[3]
 
-	getInfos := func(date string, category string) map[int64]*Info {
+	getInfos := func(date string, category int) map[int64]*Info {
 		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
 		LEFT JOIN items b
 		ON a.sku = b.sku
@@ -89,14 +109,6 @@ func main() {
 			prevInfo.Rank/60+1, prevInfo.Rank%60+1,
 			delta/60+1, delta%60+1,
 			curInfo.ShopName)
-
-		var c int
-		err := db.Get(&c, `SELECT COUNT(*) FROM images
-			WHERE sku = $1`, curInfo.Sku)
-		ce(err, "get image count")
-		if c == 0 { // download images
-			//TODO
-		}
 	}
 
 }

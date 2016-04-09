@@ -12,6 +12,7 @@ import "github.com/jmoiron/sqlx"
 import "strconv"
 import "strings"
 import "encoding/json"
+import "golang.org/x/net/trace"
 
 var pt = fmt.Printf
 
@@ -19,38 +20,43 @@ var categories = []int{
 	1354,  // 衬衫
 	1355,  // T恤
 	1356,  // 针织衫
-	3983,  // 羽绒服
-	9705,  // 棉服
-	9706,  // 毛呢大衣
-	9707,  // 真皮皮衣
-	9708,  // 风衣
-	9710,  // 卫衣
-	9711,  // 小西装
-	9712,  // 短外套
 	9713,  // 雪纺衫
-	9714,  // 马甲
 	9715,  // 牛仔裤
-	9716,  // 打底裤
 	9717,  // 休闲裤
-	9718,  // 正装裤
 	9719,  // 连衣裙
 	9720,  // 半身裙
-	9721,  // 中老年女装
-	9722,  // 大码女装
-	9723,  // 婚纱
-	11985, // 打底衫
-	11986, // 旗袍，唐装
-	11987, // 加绒裤
-	11988, // 吊带，背心
-	11989, // 羊绒衫
 	11991, // 短裤
-	11993, // 皮草
-	11996, // 礼服
-	11998, // 仿皮皮衣
-	11999, // 羊毛衫
+	11988, // 吊带，背心
+
+	//3983,  // 羽绒服
+	//9705,  // 棉服
+	//9706,  // 毛呢大衣
+	//9707,  // 真皮皮衣
+	//9708,  // 风衣
+	//9710,  // 卫衣
+	//9711,  // 小西装
+	//9712,  // 短外套
+	//9714,  // 马甲
+	//9716,  // 打底裤
+	//9718,  // 正装裤
+	//9721, // 中老年女装
+	//9722, // 大码女装
+	//9723, // 婚纱
+	//11985, // 打底衫
+	//11986, // 旗袍，唐装
+	//11987, // 加绒裤
+	//11989, // 羊绒衫
+	//11993, // 皮草
+	//11996, // 礼服
+	//11998, // 仿皮皮衣
+	//11999, // 羊毛衫
 }
 
 var date = time.Now().Format("20060102")
+
+func init() {
+	go http.ListenAndServe(":31122", nil)
+}
 
 func main() {
 	collectCategoryPages()
@@ -69,7 +75,7 @@ const maxPage = 300
 
 func collectCategoryPages() {
 
-	infosChan := make(chan map[int64]*Info)
+	infosChan := make(chan map[int64]*Info, 16)
 	infosMap := make(map[int64]*Info)
 	infosMapReady := make(chan struct{})
 	go func() {
@@ -94,14 +100,19 @@ func collectCategoryPages() {
 					<-sem
 					wg.Done()
 				}()
+				tr := trace.New("collect-job", fmt.Sprintf("cat %d page %d", category, page))
+				defer tr.Finish()
 				retry := 5
 			collect:
-				if err := collectCategoryPage(category, page, infosChan); err != nil {
+				tr.LazyPrintf("start collect")
+				if err := collectCategoryPage(category, page, infosChan, tr); err != nil {
+					tr.LazyPrintf("collect error: %v", err)
 					if retry > 0 {
 						retry--
-						time.Sleep(time.Second)
+						tr.LazyPrintf("retry %d", retry)
 						goto collect
 					}
+					tr.LazyPrintf("collect fail")
 					ce(err, "collect %v %v", category, page)
 				}
 			}()
@@ -180,21 +191,25 @@ const itemsPerPage = 60
 
 var pageCount int64
 
-func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info) (err error) {
+func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info, tr trace.Trace) (err error) {
 	defer ct(&err)
 	pt("%-10d %-10d %-10d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
 		category, page)
+	tr.LazyPrintf("start get %s", pageUrl)
 	resp, err := http.Get(pageUrl)
 	ce(err, "get page %s", pageUrl)
 	defer resp.Body.Close()
+	tr.LazyPrintf("get req done, start reading content")
 	content, err := ioutil.ReadAll(resp.Body)
 	ce(err, "read body")
+	tr.LazyPrintf("get content done")
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(content))
 	ce(err, "doc from reader %s", pageUrl)
 	itemSes := doc.Find("div#plist div.j-sku-item")
 	infos := make(map[int64]*Info)
 	ce(withTx(db, func(tx *sqlx.Tx) (err error) {
+		tr.LazyPrintf("start parsing entries")
 		defer ct(&err)
 		itemSes.Each(func(i int, se *goquery.Selection) {
 			skuStr, ok := se.Attr("data-sku")
@@ -220,6 +235,7 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info)
 			}
 			sales, err := strconv.Atoi(salesStr)
 			ce(err, "parse sales %s", salesStr)
+			tr.LazyPrintf("parse info done %d %s", sku, title)
 			_, err = tx.Exec(`INSERT INTO shops (shop_id) VALUES ($1)
 				ON CONFLICT (shop_id) DO NOTHING`,
 				shopId,
@@ -230,6 +246,7 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info)
 				sku, category, shopId, title,
 			)
 			ce(err, "insert item")
+			tr.LazyPrintf("insert into shops and items done")
 			infos[sku] = &Info{
 				Sku:      sku,
 				Rank:     itemsPerPage*(page-1) + i,
@@ -245,8 +262,10 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info)
 	for _, info := range infos {
 		skuIds = append(skuIds, "J_"+strconv.FormatInt(info.Sku, 10))
 	}
+	tr.LazyPrintf("start get prices")
 	data, err := getPrices(skuIds)
 	ce(err, "get prices")
+	tr.LazyPrintf("get prices done")
 	if len(data) != len(infos) {
 		panic(me(nil, "invalid json"))
 	}
@@ -257,6 +276,7 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info)
 	}
 
 	infosChan <- infos
+	tr.LazyPrintf("infos pushed to collector")
 
 	return
 }
@@ -279,6 +299,7 @@ collectPrices:
 	if err != nil {
 		if retry > 0 {
 			retry--
+			pt("%v\n", err)
 			goto collectPrices
 		}
 		ce(err, "decode %s, %s", reqUrl, content)
