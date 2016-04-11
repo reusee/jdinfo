@@ -212,29 +212,39 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info,
 		tr.LazyPrintf("start parsing entries")
 		defer ct(&err)
 		itemSes.Each(func(i int, se *goquery.Selection) {
+			// href
+			href, ok := se.Find("div.p-name a").Attr("href")
+			if !ok {
+				panic(me(nil, "no href %s", pageUrl))
+			}
+			if strings.Contains(href, "ccc.x.jd.com") { // 推广商品
+				return
+			}
+			// sku
 			skuStr, ok := se.Attr("data-sku")
 			if !ok {
 				panic(me(nil, "no sku %s", pageUrl))
 			}
 			sku, err := strconv.ParseInt(skuStr, 10, 64)
 			ce(err, "parse sku")
+			// shop id
 			shopId, ok := se.Attr("jdzy_shop_id")
 			if !ok {
 				panic(me(nil, "no shop id %s", pageUrl))
 			}
-			//if shopId == "0" { // 自营的
-			//	return
-			//}
+			// title
 			title := se.Find("div.p-name em").Text()
 			if len(title) == 0 {
 				panic(me(nil, "no title %s", pageUrl))
 			}
+			// sales
 			salesStr := se.Find("div.p-commit a").Text()
 			if len(salesStr) == 0 {
 				panic(me(nil, "no sales %s", pageUrl))
 			}
 			sales, err := strconv.Atoi(salesStr)
 			ce(err, "parse sales %s", salesStr)
+
 			tr.LazyPrintf("parse info done %d %s", sku, title)
 			_, err = tx.Exec(`INSERT INTO shops (shop_id) VALUES ($1)
 				ON CONFLICT (shop_id) DO NOTHING`,

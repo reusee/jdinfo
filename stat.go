@@ -44,28 +44,43 @@ var categories = map[string]int{
 }
 
 func main() {
-	for name, category := range categories {
-		fmt.Printf("=== %s ===\n", name)
-		statCategory(category)
-		fmt.Printf("\n")
+	for catName := range categories {
+		statCategory(catName)
 	}
 }
 
-func statCategory(category int) {
+func statCategory(catName string) {
+	category := categories[catName]
 	prevDate := os.Args[1]
 	curDate := os.Args[2]
+	location := "广东  广州市"
+	maxSales := 10
+	fmt.Printf("=== category %s %s to %s location %s max sales %d ===\n",
+		catName,
+		prevDate,
+		curDate,
+		location,
+		maxSales,
+	)
 
 	getInfos := func(date string, category int) map[int64]*Info {
 		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
-		LEFT JOIN items b
-		ON a.sku = b.sku
-		LEFT JOIN shops c
-		ON b.shop_id = c.shop_id
-		WHERE a.category = $1
-		AND date = $2
-		AND sales < 10
-		AND location = '广东  广州市'
-		`, category, date)
+			LEFT JOIN items b
+			ON a.sku = b.sku
+			LEFT JOIN shops c
+			ON b.shop_id = c.shop_id
+
+			WHERE a.category = $1
+			AND date = $2
+			AND sales < $3
+			AND location = $4
+
+			`,
+			category,
+			date,
+			maxSales,
+			location,
+		)
 		ce(err, "query")
 		infos := make(map[int64]*Info)
 		for rows.Next() {
@@ -98,7 +113,6 @@ func statCategory(category int) {
 		return (a[0].Rank - a[1].Rank) > (b[0].Rank - b[1].Rank)
 	})
 
-	fmt.Printf("%d entries\n", len(pairs))
 	for i, pair := range pairs {
 		prevInfo, curInfo := pair[0], pair[1]
 		delta := prevInfo.Rank - curInfo.Rank
@@ -111,6 +125,7 @@ func statCategory(category int) {
 			curInfo.ShopName)
 	}
 
+	fmt.Print("\n")
 }
 
 type Err struct {
