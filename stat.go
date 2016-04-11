@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -43,18 +44,70 @@ var categories = map[string]int{
 	"吊带，背心": 11988,
 }
 
+const location = "广东  广州市"
+const maxSales = 50
+const maxCurPage = 50
+const minRankDelta = 30
+
 func main() {
-	for catName := range categories {
-		statCategory(catName)
+	prevDate := os.Args[1]
+	curDate := os.Args[2]
+	if len(os.Args) > 3 {
+		statKeywords(prevDate, curDate, os.Args[3:])
+	} else {
+		for catName := range categories {
+			statCategory(prevDate, curDate, catName)
+		}
 	}
 }
 
-func statCategory(catName string) {
+func statKeywords(prevDate, curDate string, keywords []string) {
+	getInfosByKeywords := func(date string, keywords []string) map[int64]*Info {
+		keywordConditions := []string{}
+		for _, keyword := range keywords {
+			keywordConditions = append(keywordConditions, `AND title LIKE '%`+keyword+`%'`)
+		}
+		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
+			LEFT JOIN items b
+			ON a.sku = b.sku
+			LEFT JOIN shops c
+			ON b.shop_id = c.shop_id
+
+			WHERE 
+			date = $1
+			AND sales < $2
+			AND location = $3
+
+			`+strings.Join(keywordConditions, ""),
+			date,
+			maxSales,
+			location,
+		)
+		ce(err, "query")
+		infos := make(map[int64]*Info)
+		for rows.Next() {
+			info := new(Info)
+			ce(rows.StructScan(info), "scan")
+			infos[info.Sku] = info
+		}
+		ce(rows.Err(), "rows err")
+		return infos
+	}
+
+	prevInfos := getInfosByKeywords(prevDate, keywords)
+	if len(prevInfos) == 0 {
+		panic(me(nil, "invalid prev date %s", prevDate))
+	}
+	curInfos := getInfosByKeywords(curDate, keywords)
+	if len(curInfos) == 0 {
+		panic(me(nil, "invalid cur date %s", curDate))
+	}
+
+	pickupItems(prevInfos, curInfos)
+}
+
+func statCategory(prevDate, curDate string, catName string) {
 	category := categories[catName]
-	prevDate := os.Args[1]
-	curDate := os.Args[2]
-	location := "广东  广州市"
-	maxSales := 10
 	fmt.Printf("=== category %s %s to %s location %s max sales %d ===\n",
 		catName,
 		prevDate,
@@ -63,7 +116,7 @@ func statCategory(catName string) {
 		maxSales,
 	)
 
-	getInfos := func(date string, category int) map[int64]*Info {
+	getInfosByCategory := func(date string, category int) map[int64]*Info {
 		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
 			LEFT JOIN items b
 			ON a.sku = b.sku
@@ -91,19 +144,24 @@ func statCategory(catName string) {
 		ce(rows.Err(), "rows err")
 		return infos
 	}
-	prevInfos := getInfos(prevDate, category)
+
+	prevInfos := getInfosByCategory(prevDate, category)
 	if len(prevInfos) == 0 {
 		panic(me(nil, "invalid prev date %s", prevDate))
 	}
-	curInfos := getInfos(curDate, category)
+	curInfos := getInfosByCategory(curDate, category)
 	if len(curInfos) == 0 {
 		panic(me(nil, "invalid cur date %s", curDate))
 	}
 
+	pickupItems(prevInfos, curInfos)
+}
+
+func pickupItems(prevInfos, curInfos map[int64]*Info) {
 	pairs := InfoPair(make([][2]*Info, 0))
 	for sku, curInfo := range curInfos {
 		prevInfo, ok := prevInfos[sku]
-		if ok && curInfo.Rank < prevInfo.Rank && curInfo.Rank <= 3000 && prevInfo.Rank-curInfo.Rank > 60 {
+		if ok && curInfo.Rank < prevInfo.Rank && curInfo.Rank <= maxCurPage*60 && prevInfo.Rank-curInfo.Rank > minRankDelta {
 			pairs = append(pairs, [2]*Info{
 				prevInfo, curInfo,
 			})
