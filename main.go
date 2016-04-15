@@ -13,8 +13,7 @@ import "strconv"
 import "strings"
 import "encoding/json"
 import "golang.org/x/net/trace"
-
-var pt = fmt.Printf
+import "github.com/reusee/proxy"
 
 var categories = []int{
 	1354,  // 衬衫
@@ -54,8 +53,21 @@ var categories = []int{
 
 var date = time.Now().Format("20060102")
 
+const semSize = 8
+
 func init() {
 	go http.ListenAndServe(":31122", nil)
+}
+
+var startTime = time.Now()
+var ptLock sync.Mutex
+
+func pt(format string, args ...interface{}) {
+	now := time.Now()
+	ptLock.Lock()
+	fmt.Printf("%-10s%-17v", now.Format("15:04:05"), now.Sub(startTime))
+	fmt.Printf(format, args...)
+	ptLock.Unlock()
 }
 
 func main() {
@@ -89,7 +101,7 @@ func collectCategoryPages() {
 
 	wg := new(sync.WaitGroup)
 	wg.Add(len(categories) * maxPage)
-	sem := make(chan bool, 8)
+	sem := make(chan bool, semSize)
 	for _, category := range categories {
 		for page := 1; page <= maxPage; page++ {
 			category := category
@@ -129,16 +141,27 @@ func collectCategoryPages() {
 	c := 0
 	tx := db.MustBegin()
 	for sku, info := range infosMap {
-		_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category, price) 
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (sku, date, category) DO UPDATE SET 
-			rank = $3, sales = $4, price = $6`,
+		/*
+			_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category, price)
+				VALUES ($1, $2, $3, $4, $5, $6)
+				ON CONFLICT (sku, date, category) DO UPDATE SET
+				rank = $3, sales = $4, price = $6`,
+				sku,
+				date,
+				info.Rank,
+				info.Sales,
+				info.Category,
+				info.Price)
+		*/
+		_, err := tx.Exec(`INSERT INTO infos (sku, date, rank, sales, category)
+				VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (sku, date, category) DO UPDATE SET
+				rank = $3, sales = $4`,
 			sku,
 			date,
 			info.Rank,
 			info.Sales,
-			info.Category,
-			info.Price)
+			info.Category)
 		ce(err, "insert rank")
 		c++
 		if c%2048 == 0 {
@@ -152,9 +175,9 @@ func collectCategoryPages() {
 	// re-collect invalid prices
 	var skus []int64
 	err := db.Select(&skus, `SELECT sku FROM infos
-			WHERE 
-			date = $1
-			AND price <= 0`,
+				WHERE
+				date = $1
+				AND price <= 0`,
 		date)
 	ce(err, "select skus")
 	for i := 0; i < len(skus)/60+1; i++ {
@@ -172,10 +195,10 @@ func collectCategoryPages() {
 		tx := db.MustBegin()
 		for _, row := range data {
 			_, err = tx.Exec(`UPDATE infos SET
-				price = $1
-				WHERE
-				sku = $2
-				AND date = $3`,
+					price = $1
+					WHERE
+					sku = $2
+					AND date = $3`,
 				row.P,
 				row.Id[2:],
 				date)
@@ -193,17 +216,25 @@ var pageCount int64
 
 func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info, tr trace.Trace) (err error) {
 	defer ct(&err)
-	pt("%-10d %-10d %-10d\n", atomic.AddInt64(&pageCount, 1), category, page)
+	pt("count %-7d category %-7d page %-7d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
 		category, page)
 	tr.LazyPrintf("start get %s", pageUrl)
-	resp, err := http.Get(pageUrl)
-	ce(err, "get page %s", pageUrl)
-	defer resp.Body.Close()
-	tr.LazyPrintf("get req done, start reading content")
-	content, err := ioutil.ReadAll(resp.Body)
-	ce(err, "read body")
-	tr.LazyPrintf("get content done")
+	var content []byte
+	clientSet.Do(func(client *http.Client) proxy.ClientState {
+		resp, err := client.Get(pageUrl)
+		if err != nil {
+			return proxy.Bad
+		}
+		defer resp.Body.Close()
+		tr.LazyPrintf("get req done, start reading content")
+		content, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return proxy.Bad
+		}
+		tr.LazyPrintf("get content done")
+		return proxy.Good
+	})
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(content))
 	ce(err, "doc from reader %s", pageUrl)
 	itemSes := doc.Find("div#plist div.j-sku-item")
@@ -272,17 +303,19 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info,
 	for _, info := range infos {
 		skuIds = append(skuIds, "J_"+strconv.FormatInt(info.Sku, 10))
 	}
-	tr.LazyPrintf("start get prices")
-	data, err := getPrices(skuIds)
-	ce(err, "get prices")
-	tr.LazyPrintf("get prices done")
-	if len(data) != len(infos) {
-		panic(me(nil, "invalid json"))
-	}
-	for _, priceInfo := range data {
-		sku, err := strconv.ParseInt(priceInfo.Id[2:], 10, 64)
-		ce(err, "parse sku %s", priceInfo.Id)
-		infos[sku].Price = priceInfo.P
+	if len(skuIds) > 0 {
+		tr.LazyPrintf("start get prices")
+		data, err := getPrices(skuIds)
+		ce(err, "get prices")
+		tr.LazyPrintf("get prices done")
+		if len(data) != len(infos) {
+			panic(me(nil, "invalid json"))
+		}
+		for _, priceInfo := range data {
+			sku, err := strconv.ParseInt(priceInfo.Id[2:], 10, 64)
+			ce(err, "parse sku %s", priceInfo.Id)
+			infos[sku].Price = priceInfo.P
+		}
 	}
 
 	infosChan <- infos
@@ -296,24 +329,24 @@ func getPrices(skuIds []string) (data []struct {
 	P  string
 }, err error) {
 	defer ct(&err)
-	retry := 10
-collectPrices:
 	reqUrl := "http://p.3.cn/prices/mgets?type=1&skuIds=" +
 		strings.Join(skuIds, ",")
-	resp, err := http.Get(reqUrl)
-	ce(err, "get %s", reqUrl)
-	defer resp.Body.Close()
-	content, err := ioutil.ReadAll(resp.Body)
-	ce(err, "read body")
-	err = json.Unmarshal(content, &data)
-	if err != nil {
-		if retry > 0 {
-			retry--
-			pt("%v\n", err)
-			goto collectPrices
+	clientSet.Do(func(client *http.Client) proxy.ClientState {
+		resp, err := client.Get(reqUrl)
+		if err != nil {
+			return proxy.Bad
 		}
-		ce(err, "decode %s, %s", reqUrl, content)
-	}
+		defer resp.Body.Close()
+		content, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return proxy.Bad
+		}
+		err = json.Unmarshal(content, &data)
+		if err != nil {
+			return proxy.Bad
+		}
+		return proxy.Good
+	})
 	return
 }
 
@@ -324,7 +357,7 @@ func collectShopLocations() {
 	ce(err, "select shop ids without location")
 	wg := new(sync.WaitGroup)
 	wg.Add(len(ids))
-	sem := make(chan bool, 4)
+	sem := make(chan bool, semSize)
 	for _, id := range ids {
 		id := id
 		sem <- true

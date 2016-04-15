@@ -46,8 +46,8 @@ var categories = map[string]int{
 
 const location = "广东  广州市"
 const maxSales = 50
-const maxCurPage = 50
-const minRankDelta = 30
+const maxCurPage = 30
+const minRankDelta = 10
 
 func main() {
 	prevDate := os.Args[1]
@@ -179,7 +179,7 @@ func pickupItems(prevInfos, curInfos map[int64]*Info) {
 			fmt.Sprintf("http://item.jd.com/%d.html", curInfo.Sku),
 			curInfo.Rank/60+1, curInfo.Rank%60+1,
 			prevInfo.Rank/60+1, prevInfo.Rank%60+1,
-			delta/60+1, delta%60+1,
+			delta/60, delta%60,
 			curInfo.ShopName)
 	}
 
