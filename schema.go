@@ -54,6 +54,7 @@ func initSchema() {
 	db.MustExec(`CREATE INDEX IF NOT EXISTS category ON infos (category)`)
 
 	db.MustExec(`CREATE TABLE IF NOT EXISTS images (
+		image_id SERIAL PRIMARY KEY,
 		sku BIGINT NOT NULL,
 		url TEXT NOT NULL,
 		sha512_16k BYTEA
