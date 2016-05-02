@@ -1,13 +1,21 @@
-//+build ignore
-
 package main
 
 import (
+	"crypto/sha512"
+	"io"
+	"io/ioutil"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"regexp"
 	"sort"
-	"strings"
 
+	"strings"
+	"sync"
+
+	"github.com/fatih/color"
 	"github.com/jmoiron/sqlx"
+	"github.com/reusee/proxy"
 )
 
 import _ "github.com/lib/pq"
@@ -16,12 +24,18 @@ import "fmt"
 
 import "math/rand"
 
-var db *sqlx.DB
+var vvicDb, db *sqlx.DB
+
+var clientSet = proxy.NewClientSet()
 
 func init() {
 	var err error
 	db, err = sqlx.Connect("postgres", "user=reus dbname=jd sslmode=disable")
 	ce(err, "connect to db")
+	vvicDb, err = sqlx.Connect("postgres", "user=reus dbname=vvic sslmode=disable")
+	ce(err, "connect to vvic db")
+
+	go http.ListenAndServe(":27777", nil)
 }
 
 type Info struct {
@@ -45,9 +59,16 @@ var categories = map[string]int{
 }
 
 const location = "广东  广州市"
+
 const maxSales = 50
-const maxCurPage = 30
+
+const maxCurPage = 20
+
 const minRankDelta = 10
+
+const minPrice = 80
+
+//TODO 搜索desc: '，采集图片，判断是否沙河货
 
 func main() {
 	prevDate := os.Args[1]
@@ -67,7 +88,7 @@ func statKeywords(prevDate, curDate string, keywords []string) {
 		for _, keyword := range keywords {
 			keywordConditions = append(keywordConditions, `AND title LIKE '%`+keyword+`%'`)
 		}
-		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
+		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id FROM infos a
 			LEFT JOIN items b
 			ON a.sku = b.sku
 			LEFT JOIN shops c
@@ -78,10 +99,13 @@ func statKeywords(prevDate, curDate string, keywords []string) {
 			AND sales < $2
 			AND location = $3
 
+			AND (price >= $4 OR price <= 0) -- 可能有些价格采集不到
+
 			`+strings.Join(keywordConditions, ""),
 			date,
 			maxSales,
 			location,
+			minPrice,
 		)
 		ce(err, "query")
 		infos := make(map[int64]*Info)
@@ -181,9 +205,134 @@ func pickupItems(prevInfos, curInfos map[int64]*Info) {
 			prevInfo.Rank/60+1, prevInfo.Rank%60+1,
 			delta/60, delta%60,
 			curInfo.ShopName)
+
+		// find vvic items
+		var hashes [][]byte
+		err := db.Select(&hashes, `SELECT sha512_16k FROM images
+			WHERE sku = $1`,
+			curInfo.Sku)
+		ce(err, "select hashes")
+		if len(hashes) < 2 {
+			err := collectImages(curInfo.Sku)
+			ce(err, "collect images")
+			err = db.Select(&hashes, `SELECT sha512_16k FROM images
+			WHERE sku = $1`,
+				curInfo.Sku)
+			ce(err, "select hashes")
+		}
+
+		stat := make(map[int]int)
+		for _, hash := range hashes {
+			var vvicIds []int
+			err = vvicDb.Select(&vvicIds, `SELECT a.good_id FROM goods a
+				LEFT JOIN images b
+				ON a.good_id = b.good_id
+				LEFT JOIN urls c
+				ON b.url_id = c.url_id
+				WHERE sha512_16k = $1
+				AND status > 0
+				`,
+				hash,
+			)
+			ce(err, "select vvic ids")
+			for _, id := range vvicIds {
+				stat[id]++
+			}
+		}
+		ids := Ints([]int{})
+		for id := range stat {
+			ids = append(ids, id)
+		}
+		ids.Sort(func(a, b int) bool {
+			return stat[a] > stat[b]
+		})
+		for i := 0; i < 8 && i < len(ids); i++ {
+			color.Green("http://www.vvic.com/item.html?id=%d\n", ids[i])
+		}
+
 	}
 
 	fmt.Print("\n")
+}
+
+var descUrlPattern = regexp.MustCompile(`desc: '([^']+)'`)
+
+var imageUrlPattern = regexp.MustCompile(`//img[0-9]*\.360buyimg\.com[^\\]+`)
+
+func collectImages(sku int64) (err error) {
+	defer ct(&err)
+	// collect images and hash
+	itemPageUrl := fmt.Sprintf("http://item.jd.com/%d.html", sku)
+	var content []byte
+	getContent(&content, itemPageUrl)
+	descUrlMatches := descUrlPattern.FindSubmatch(content)
+	if len(descUrlMatches) == 0 {
+		ce(nil, "desc url not found %d", sku)
+	}
+	descUrl := "http:" + string(descUrlMatches[1])
+	fmt.Printf("%s\n", descUrl)
+	var desc []byte
+	getContent(&desc, descUrl)
+	images := imageUrlPattern.FindAll(desc, -1)
+	tx := db.MustBegin()
+	wg := new(sync.WaitGroup)
+	wg.Add(len(images))
+	sem := make(chan bool, 8)
+	for _, imageUrlBs := range images {
+		imageUrl := "http:" + string(imageUrlBs)
+		fmt.Printf("%s\n", imageUrl)
+		sem <- true
+		go func() {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			var sum []byte
+			clientSet.Do(func(client *http.Client) proxy.ClientState {
+				resp, err := client.Get(imageUrl)
+				if err != nil {
+					return proxy.Bad
+				}
+				defer resp.Body.Close()
+				h := sha512.New()
+				_, err = io.CopyN(h, resp.Body, 16384)
+				if err == io.EOF {
+					err = nil
+				}
+				if err != nil {
+					return proxy.Bad
+				}
+				sum = h.Sum(nil)
+				return proxy.Good
+			})
+			_, err = tx.Exec(`INSERT INTO images (sku, url, sha512_16k) VALUES ($1, $2, $3)
+					ON CONFLICT (sku, url) DO NOTHING`,
+				sku,
+				imageUrl,
+				sum,
+			)
+			ce(err, "insert image")
+		}()
+	}
+	wg.Wait()
+	ce(tx.Commit(), "commit")
+	return
+}
+
+func getContent(ret *[]byte, url string) {
+	clientSet.Do(func(client *http.Client) proxy.ClientState {
+		resp, err := client.Get(url)
+		if err != nil {
+			return proxy.Bad
+		}
+		defer resp.Body.Close()
+		content, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return proxy.Bad
+		}
+		*ret = content
+		return proxy.Good
+	})
 }
 
 type Err struct {
@@ -328,6 +477,82 @@ func (t sliceSorter) Swap(i, j int) {
 
 func (s InfoPair) Clone() (ret InfoPair) {
 	ret = make([][2]*Info, len(s))
+	copy(ret, s)
+	return
+}
+
+type Ints []int
+
+func (s Ints) Reduce(initial interface{}, fn func(value interface{}, elem int) interface{}) (ret interface{}) {
+	ret = initial
+	for _, elem := range s {
+		ret = fn(ret, elem)
+	}
+	return
+}
+
+func (s Ints) Map(fn func(int) int) (ret Ints) {
+	for _, elem := range s {
+		ret = append(ret, fn(elem))
+	}
+	return
+}
+
+func (s Ints) Filter(filter func(int) bool) (ret Ints) {
+	for _, elem := range s {
+		if filter(elem) {
+			ret = append(ret, elem)
+		}
+	}
+	return
+}
+
+func (s Ints) All(predict func(int) bool) (ret bool) {
+	ret = true
+	for _, elem := range s {
+		ret = predict(elem) && ret
+	}
+	return
+}
+
+func (s Ints) Any(predict func(int) bool) (ret bool) {
+	for _, elem := range s {
+		ret = predict(elem) || ret
+	}
+	return
+}
+
+func (s Ints) Each(fn func(e int)) {
+	for _, elem := range s {
+		fn(elem)
+	}
+}
+
+func (s Ints) Shuffle() {
+	for i := len(s) - 1; i >= 1; i-- {
+		j := rand.Intn(i + 1)
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
+func (s Ints) Sort(cmp func(a, b int) bool) {
+	sorter := sliceSorter{
+		l: len(s),
+		less: func(i, j int) bool {
+			return cmp(s[i], s[j])
+		},
+		swap: func(i, j int) {
+			s[i], s[j] = s[j], s[i]
+		},
+	}
+	_ = sorter.Len
+	_ = sorter.Less
+	_ = sorter.Swap
+	sort.Sort(sorter)
+}
+
+func (s Ints) Clone() (ret Ints) {
+	ret = make([]int, len(s))
 	copy(ret, s)
 	return
 }

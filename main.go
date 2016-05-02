@@ -24,8 +24,11 @@ var categories = []int{
 	9717,  // 休闲裤
 	9719,  // 连衣裙
 	9720,  // 半身裙
-	11991, // 短裤
+	9721,  // 中老年女装
+	9722,  // 大码女装
+	11986, // 旗袍，唐装
 	11988, // 吊带，背心
+	11991, // 短裤
 
 	//3983,  // 羽绒服
 	//9705,  // 棉服
@@ -38,11 +41,8 @@ var categories = []int{
 	//9714,  // 马甲
 	//9716,  // 打底裤
 	//9718,  // 正装裤
-	//9721, // 中老年女装
-	//9722, // 大码女装
 	//9723, // 婚纱
 	//11985, // 打底衫
-	//11986, // 旗袍，唐装
 	//11987, // 加绒裤
 	//11989, // 羊绒衫
 	//11993, // 皮草
@@ -53,7 +53,7 @@ var categories = []int{
 
 var date = time.Now().Format("20060102")
 
-const semSize = 8
+const semSize = 64
 
 func init() {
 	go http.ListenAndServe(":31122", nil)
@@ -173,40 +173,42 @@ func collectCategoryPages() {
 	pt("infos updated\n")
 
 	// re-collect invalid prices
-	var skus []int64
-	err := db.Select(&skus, `SELECT sku FROM infos
-				WHERE
-				date = $1
-				AND price <= 0`,
-		date)
-	ce(err, "select skus")
-	for i := 0; i < len(skus)/60+1; i++ {
-		start := i * 60
-		end := start + 60
-		if end > len(skus) {
-			end = len(skus)
-		}
-		var skuIds []string
-		for _, sku := range skus[start:end] {
-			skuIds = append(skuIds, "J_"+strconv.FormatInt(sku, 10))
-		}
-		data, err := getPrices(skuIds)
-		ce(err, "get prices")
-		tx := db.MustBegin()
-		for _, row := range data {
-			_, err = tx.Exec(`UPDATE infos SET
-					price = $1
+	/*
+		var skus []int64
+		err := db.Select(&skus, `SELECT sku FROM infos
 					WHERE
-					sku = $2
-					AND date = $3`,
-				row.P,
-				row.Id[2:],
-				date)
-			ce(err, "update price")
+					date = $1
+					AND price <= 0`,
+			date)
+		ce(err, "select skus")
+		for i := 0; i < len(skus)/60+1; i++ {
+			start := i * 60
+			end := start + 60
+			if end > len(skus) {
+				end = len(skus)
+			}
+			var skuIds []string
+			for _, sku := range skus[start:end] {
+				skuIds = append(skuIds, "J_"+strconv.FormatInt(sku, 10))
+			}
+			data, err := getPrices(skuIds)
+			ce(err, "get prices")
+			tx := db.MustBegin()
+			for _, row := range data {
+				_, err = tx.Exec(`UPDATE infos SET
+						price = $1
+						WHERE
+						sku = $2
+						AND date = $3`,
+					row.P,
+					row.Id[2:],
+					date)
+				ce(err, "update price")
+			}
+			ce(tx.Commit(), "commit")
+			pt("%v\n", skuIds)
 		}
-		ce(tx.Commit(), "commit")
-		pt("%v\n", skuIds)
-	}
+	*/
 
 }
 
@@ -216,7 +218,6 @@ var pageCount int64
 
 func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info, tr trace.Trace) (err error) {
 	defer ct(&err)
-	pt("count %-7d category %-7d page %-7d\n", atomic.AddInt64(&pageCount, 1), category, page)
 	pageUrl := fmt.Sprintf("http://list.jd.com/list.html?cat=1315,1343,%d&page=%d&sort=sort_totalsales15_desc",
 		category, page)
 	tr.LazyPrintf("start get %s", pageUrl)
@@ -321,6 +322,7 @@ func collectCategoryPage(category int, page int, infosChan chan map[int64]*Info,
 	infosChan <- infos
 	tr.LazyPrintf("infos pushed to collector")
 
+	pt("count %-7d category %-7d page %-7d items %-7d\n", atomic.AddInt64(&pageCount, 1), category, page, len(skuIds))
 	return
 }
 
