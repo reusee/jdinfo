@@ -45,17 +45,22 @@ type Info struct {
 	ShopName string `db:"shop_name"`
 }
 
-var categories = map[string]int{
-	"衬衫":    1354,
-	"T恤":    1355,
-	"针织衫":   1356,
-	"雪纺衫":   9713,
-	"牛仔裤":   9715,
-	"休闲裤":   9717,
-	"连衣裙":   9719,
-	"半身裙":   9720,
-	"短裤":    11991,
-	"吊带，背心": 11988,
+type Category struct {
+	Name string
+	Id   int
+}
+
+var categories = []Category{
+	{"休闲裤", 9717},
+	{"衬衫", 1354},
+	{"T恤", 1355},
+	{"针织衫", 1356},
+	{"雪纺衫", 9713},
+	{"牛仔裤", 9715},
+	{"连衣裙", 9719},
+	{"半身裙", 9720},
+	{"短裤", 11991},
+	{"吊带，背心", 11988},
 }
 
 const location = "广东  广州市"
@@ -68,21 +73,117 @@ const minRankDelta = 10
 
 const minPrice = 80
 
-//TODO 搜索desc: '，采集图片，判断是否沙河货
-
 func main() {
-	prevDate := os.Args[1]
-	curDate := os.Args[2]
-	if len(os.Args) > 3 {
-		statKeywords(prevDate, curDate, os.Args[3:])
-	} else {
-		for catName := range categories {
-			statCategory(prevDate, curDate, catName)
+	cmd := os.Args[1]
+	switch cmd {
+	case "delta":
+		prevDate := os.Args[2]
+		curDate := os.Args[3]
+		if len(os.Args) > 4 {
+			statDeltaByKeywords(prevDate, curDate, os.Args[4:])
+		} else {
+			for _, category := range categories {
+				statDeltaByCategory(prevDate, curDate, category)
+			}
 		}
+	case "best":
+		date := os.Args[2]
+		if len(os.Args) > 3 {
+			statBestByKeywords(date, os.Args[3:])
+		} else {
+			for _, category := range categories {
+				statBestByCategory(date, category)
+			}
+		}
+	default:
+		panic("no such command")
 	}
 }
 
-func statKeywords(prevDate, curDate string, keywords []string) {
+func statBestByKeywords(date string, keywords []string) {
+	keywordConditions := []string{}
+	for _, keyword := range keywords {
+		keywordConditions = append(keywordConditions, `AND title LIKE '%`+keyword+`%'`)
+	}
+	rows, err := db.Queryx(`SELECT a.sku FROM infos a
+		LEFT JOIN items b
+		ON a.sku = b.sku
+		LEFT JOIN shops c
+		ON b.shop_id = c.shop_id
+
+		WHERE 
+		date = $1
+		AND location = $2
+		`+strings.Join(keywordConditions, "")+`
+		ORDER BY rank ASC
+		LIMIT 1024
+		`,
+		date,
+		location,
+	)
+	ce(err, "query")
+	total := 0
+	for rows.Next() {
+		info := new(Info)
+		ce(rows.StructScan(info), "scan")
+		fmt.Printf("http://item.jd.com/%d.html\n", info.Sku)
+		n, err := printVvicItem(info.Sku)
+		ce(err, "print vvic item")
+		if n > 0 {
+			total++
+		}
+		if total > 50 {
+			rows.Close()
+			break
+		}
+	}
+	ce(rows.Err(), "rows err")
+}
+
+func statBestByCategory(date string, category Category) {
+	fmt.Printf("=== category %s %s location %s ===\n",
+		category.Name,
+		date,
+		location,
+	)
+
+	rows, err := db.Queryx(`SELECT a.sku FROM infos a
+		LEFT JOIN items b
+		ON a.sku = b.sku
+		LEFT JOIN shops c
+		ON b.shop_id = c.shop_id
+
+		WHERE a.category = $1
+		AND date = $2
+		AND location = $3
+
+		ORDER BY rank ASC
+		LIMIT 1024
+			`,
+		category.Id,
+		date,
+		location,
+	)
+	ce(err, "query")
+	total := 0
+	for rows.Next() {
+		info := new(Info)
+		ce(rows.StructScan(info), "scan")
+		fmt.Printf("http://item.jd.com/%d.html\n", info.Sku)
+		n, err := printVvicItem(info.Sku)
+		ce(err, "print vvic item")
+		if n > 0 {
+			total++
+		}
+		if total > 50 {
+			rows.Close()
+			break
+		}
+	}
+	ce(rows.Err(), "rows err")
+}
+
+func statDeltaByKeywords(prevDate, curDate string, keywords []string) {
 	getInfosByKeywords := func(date string, keywords []string) map[int64]*Info {
 		keywordConditions := []string{}
 		for _, keyword := range keywords {
@@ -130,17 +231,16 @@ func statKeywords(prevDate, curDate string, keywords []string) {
 	pickupItems(prevInfos, curInfos)
 }
 
-func statCategory(prevDate, curDate string, catName string) {
-	category := categories[catName]
+func statDeltaByCategory(prevDate, curDate string, category Category) {
 	fmt.Printf("=== category %s %s to %s location %s max sales %d ===\n",
-		catName,
+		category.Name,
 		prevDate,
 		curDate,
 		location,
 		maxSales,
 	)
 
-	getInfosByCategory := func(date string, category int) map[int64]*Info {
+	getInfosByCategory := func(date string, categoryId int) map[int64]*Info {
 		rows, err := db.Queryx(`SELECT a.sku, rank, b.shop_id, c.name as shop_name FROM infos a
 			LEFT JOIN items b
 			ON a.sku = b.sku
@@ -153,7 +253,7 @@ func statCategory(prevDate, curDate string, catName string) {
 			AND location = $4
 
 			`,
-			category,
+			categoryId,
 			date,
 			maxSales,
 			location,
@@ -169,11 +269,11 @@ func statCategory(prevDate, curDate string, catName string) {
 		return infos
 	}
 
-	prevInfos := getInfosByCategory(prevDate, category)
+	prevInfos := getInfosByCategory(prevDate, category.Id)
 	if len(prevInfos) == 0 {
 		panic(me(nil, "invalid prev date %s", prevDate))
 	}
-	curInfos := getInfosByCategory(curDate, category)
+	curInfos := getInfosByCategory(curDate, category.Id)
 	if len(curInfos) == 0 {
 		panic(me(nil, "invalid cur date %s", curDate))
 	}
@@ -206,25 +306,34 @@ func pickupItems(prevInfos, curInfos map[int64]*Info) {
 			delta/60, delta%60,
 			curInfo.ShopName)
 
-		// find vvic items
-		var hashes [][]byte
-		err := db.Select(&hashes, `SELECT sha512_16k FROM images
-			WHERE sku = $1`,
-			curInfo.Sku)
-		ce(err, "select hashes")
-		if len(hashes) < 2 {
-			err := collectImages(curInfo.Sku)
-			ce(err, "collect images")
-			err = db.Select(&hashes, `SELECT sha512_16k FROM images
-			WHERE sku = $1`,
-				curInfo.Sku)
-			ce(err, "select hashes")
-		}
+		_, err := printVvicItem(curInfo.Sku)
+		ce(err, "print vvic item")
+	}
 
-		stat := make(map[int]int)
-		for _, hash := range hashes {
-			var vvicIds []int
-			err = vvicDb.Select(&vvicIds, `SELECT a.good_id FROM goods a
+	fmt.Print("\n")
+}
+
+func printVvicItem(sku int64) (n int, err error) {
+	defer ct(&err)
+	// find vvic items
+	var hashes [][]byte
+	err = db.Select(&hashes, `SELECT sha512_16k FROM images
+			WHERE sku = $1`,
+		sku)
+	ce(err, "select hashes")
+	if len(hashes) < 2 {
+		err := collectImages(sku)
+		ce(err, "collect images")
+		err = db.Select(&hashes, `SELECT sha512_16k FROM images
+			WHERE sku = $1`,
+			sku)
+		ce(err, "select hashes")
+	}
+
+	stat := make(map[int]int)
+	for _, hash := range hashes {
+		var vvicIds []int
+		err = vvicDb.Select(&vvicIds, `SELECT a.good_id FROM goods a
 				LEFT JOIN images b
 				ON a.good_id = b.good_id
 				LEFT JOIN urls c
@@ -232,32 +341,30 @@ func pickupItems(prevInfos, curInfos map[int64]*Info) {
 				WHERE sha512_16k = $1
 				AND status > 0
 				`,
-				hash,
-			)
-			ce(err, "select vvic ids")
-			for _, id := range vvicIds {
-				stat[id]++
-			}
+			hash,
+		)
+		ce(err, "select vvic ids")
+		for _, id := range vvicIds {
+			stat[id]++
 		}
-		ids := Ints([]int{})
-		for id := range stat {
-			ids = append(ids, id)
-		}
-		ids.Sort(func(a, b int) bool {
-			return stat[a] > stat[b]
-		})
-		for i := 0; i < 8 && i < len(ids); i++ {
-			color.Green("http://www.vvic.com/item.html?id=%d\n", ids[i])
-		}
-
 	}
-
-	fmt.Print("\n")
+	ids := Ints([]int{})
+	for id := range stat {
+		ids = append(ids, id)
+	}
+	ids.Sort(func(a, b int) bool {
+		return stat[a] > stat[b]
+	})
+	for i := 0; i < 8 && i < len(ids); i++ {
+		color.Green("http://www.vvic.com/item.html?id=%d\n", ids[i])
+		n++
+	}
+	return
 }
 
 var descUrlPattern = regexp.MustCompile(`desc: '([^']+)'`)
 
-var imageUrlPattern = regexp.MustCompile(`//img[0-9]*\.360buyimg\.com[^\\]+`)
+var imageUrlPattern = regexp.MustCompile(`//img[0-9]*\.360buyimg\.com[^\\)]+`)
 
 func collectImages(sku int64) (err error) {
 	defer ct(&err)
@@ -270,7 +377,7 @@ func collectImages(sku int64) (err error) {
 		ce(nil, "desc url not found %d", sku)
 	}
 	descUrl := "http:" + string(descUrlMatches[1])
-	fmt.Printf("%s\n", descUrl)
+	color.Cyan("collect images %s\n", descUrl)
 	var desc []byte
 	getContent(&desc, descUrl)
 	images := imageUrlPattern.FindAll(desc, -1)
@@ -288,6 +395,7 @@ func collectImages(sku int64) (err error) {
 				wg.Done()
 			}()
 			var sum []byte
+			tooSmall := false
 			clientSet.Do(func(client *http.Client) proxy.ClientState {
 				resp, err := client.Get(imageUrl)
 				if err != nil {
@@ -295,8 +403,12 @@ func collectImages(sku int64) (err error) {
 				}
 				defer resp.Body.Close()
 				h := sha512.New()
-				_, err = io.CopyN(h, resp.Body, 16384)
+				n, err := io.CopyN(h, resp.Body, 16384)
 				if err == io.EOF {
+					if n < 16384 {
+						tooSmall = true
+						return proxy.Good
+					}
 					err = nil
 				}
 				if err != nil {
@@ -305,6 +417,9 @@ func collectImages(sku int64) (err error) {
 				sum = h.Sum(nil)
 				return proxy.Good
 			})
+			if tooSmall {
+				return
+			}
 			_, err = tx.Exec(`INSERT INTO images (sku, url, sha512_16k) VALUES ($1, $2, $3)
 					ON CONFLICT (sku, url) DO NOTHING`,
 				sku,
